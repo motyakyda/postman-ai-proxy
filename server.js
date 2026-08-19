@@ -369,27 +369,110 @@ function handleLogout(req, res, idx) {
   res.end();
 }
 
+// Postman валидирует размер input.query (~10k символов), но backgroundContext
+// (AGENTS_MD) не лимитирован — проверено на 54k. Системный промпт кладём туда.
+const MAX_QUERY_BYTES = 9000;
+
+function byteLen(s) {
+  return Buffer.byteLength(s, 'utf-8');
+}
+
+function truncateText(s, maxBytes) {
+  if (byteLen(s) <= maxBytes) return s;
+  let out = '';
+  for (const ch of s) {
+    if (byteLen(out + ch) > maxBytes - 60) break;
+    out += ch;
+  }
+  return out + '\n[...truncated...]';
+}
+
+// Возвращает { query, systemContext }
+function buildQuery(messages) {
+  const systemParts = [];
+  const history = [];
+  let lastUser = '';
+  
+  for (const m of messages) {
+    const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+    if (m.role === 'system' || m.role === 'developer') {
+      systemParts.push(c);
+    } else if (m.role === 'user') {
+      if (lastUser) history.push({ role: 'user', content: lastUser });
+      lastUser = c || '';
+    } else if (m.role === 'assistant') {
+      history.push({ role: 'assistant', content: c });
+    } else if (m.role === 'tool') {
+      history.push({ role: 'tool', content: `[Tool result]: ${c}` });
+    }
+  }
+  
+  const systemText = systemParts.join('\n\n');
+  const lastUserLen = byteLen(lastUser);
+  
+  // Бюджеты: последнему сообщению пользователя — максимум места
+  let sysBudget;
+  if (lastUserLen >= MAX_QUERY_BYTES - 1500) {
+    sysBudget = 500;
+  } else {
+    sysBudget = Math.min(3500, Math.floor((MAX_QUERY_BYTES - lastUserLen) / 2));
+  }
+  
+  let query = '';
+  if (systemText) {
+    query += '[System instructions]: ' + truncateText(systemText, sysBudget) + '\n\n';
+  }
+  
+  // История — с конца (самые свежие), пока влезает
+  const histBudget = MAX_QUERY_BYTES - byteLen(query) - lastUserLen - 100;
+  if (histBudget > 300 && history.length) {
+    const parts = [];
+    let used = 0;
+    let omitted = false;
+    for (let i = history.length - 1; i >= 0; i--) {
+      const h = history[i];
+      const label = h.role === 'assistant' ? "[Assistant's previous reply]" : (h.role === 'tool' ? '[Tool]' : '[User]');
+      const line = `${label}: ${h.content}`;
+      if (used + byteLen(line) + 2 <= histBudget) {
+        parts.unshift(line);
+        used += byteLen(line) + 2;
+      } else {
+        const remain = histBudget - used - 60;
+        if (remain > 200) parts.unshift(line.slice(-remain) + '\n[...truncated...]');
+        omitted = true;
+        break;
+      }
+    }
+    if (omitted) query += '[...earlier messages omitted...]\n\n';
+    query += parts.join('\n\n') + '\n\n';
+  }
+  
+  // Последнее сообщение пользователя — приоритет
+  const lastBudget = MAX_QUERY_BYTES - byteLen(query);
+  query += lastUserLen > 0 ? truncateText(lastUser, Math.max(lastBudget, 500)) : '';
+  
+  return {
+    query: query.trim() || 'Hello',
+    // Полный system-промпт (без урезания) — уйдёт в backgroundContext.AGENTS_MD
+    systemContext: systemText || null
+  };
+}
+
 function convertOpenAIToPostman(openaiBody, workspaceId) {
   const messages = openaiBody.messages || [];
-  
-  // Формируем query: если сообщений несколько — флаттим историю в один промпт,
-  // если одно — отправляем как есть (нативное поведение Postman)
-  let query;
-  if (messages.length <= 1) {
-    const q = messages[0]?.content || '';
-    query = typeof q === 'string' ? q : JSON.stringify(q);
-  } else {
-    query = messages.map(m => {
-      const role = m.role || 'user';
-      let content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
-      if (role === 'system') return `[System instructions]: ${content}`;
-      if (role === 'assistant') return `[Assistant's previous reply]: ${content}`;
-      return `[User]: ${content}`;
-    }).join('\n\n');
-  }
+  const { query, systemContext } = buildQuery(messages);
   
   // Извлекаем conversationId для продолжения диалога (из тела или последнего сообщения)
   const conversationId = openaiBody._postman_conversation_id || openaiBody.conversation_id || null;
+  
+  const backgroundContext = [
+    { type: 'ACTIVE_ENVIRONMENT', value: null },
+    { type: 'ACTIVE_WORKSPACE', value: { name: 'Proxy Workspace', id: workspaceId } }
+  ];
+  // Полный системный промпт — в нелимитированный контекст (Postman подмешивает его как AGENTS_MD)
+  if (systemContext) {
+    backgroundContext.push({ type: 'AGENTS_MD', value: { agentsMdFileContent: systemContext } });
+  }
   
   return {
     input: {
@@ -416,10 +499,7 @@ function convertOpenAIToPostman(openaiBody, workspaceId) {
       workspaceId: workspaceId
     },
     selectedContext: [],
-    backgroundContext: [
-      { type: 'ACTIVE_ENVIRONMENT', value: null },
-      { type: 'ACTIVE_WORKSPACE', value: { name: 'Proxy Workspace', id: workspaceId } }
-    ],
+    backgroundContext: backgroundContext,
     devModeOptions: {
       selectedModel: getPostmanModel(openaiBody.model),
       isParallelToolCallingSupported: true,
