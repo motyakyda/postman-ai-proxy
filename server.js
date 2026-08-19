@@ -173,6 +173,109 @@ function htmlPage(title, bodyHtml) {
 </style></head><body>${bodyHtml}</body></html>`;
 }
 
+// ===== Импорт токена из запущенного Postman desktop (через CDP) =====
+function importFromDesktop() {
+  const { execFileSync } = require('child_process');
+  const portFile = path.join(process.env.HOME || '', 'Library', 'Application Support', 'Postman', 'DevToolsActivePort');
+  if (!fs.existsSync(portFile)) {
+    return { error: 'Postman desktop is not running (no DevToolsActivePort file). Launch Postman and sign in first.' };
+  }
+  const port = fs.readFileSync(portFile, 'utf-8').trim().split('\n')[0];
+  try {
+    // 1. список targets
+    const listRaw = execFileSync('curl', ['-s', `http://127.0.0.1:${port}/json/list`], { timeout: 5000 }).toString();
+    const targets = JSON.parse(listRaw);
+    const page = targets.find(t => t.type === 'page');
+    if (!page) return { error: 'No page target in Postman. Open the Postman app window.' };
+    
+    // 2. читаем localStorage через CDP (небольшой node-скрипт)
+    const script = `
+      const WebSocket = require('ws');
+      const ws = new WebSocket(${JSON.stringify(page.webSocketDebuggerUrl)});
+      let id = 0; const pending = new Map();
+      function call(method, params) {
+        return new Promise((resolve, reject) => {
+          const msgId = ++id;
+          const to = setTimeout(() => { pending.delete(msgId); reject(new Error('timeout')); }, 10000);
+          pending.set(msgId, (msg) => { clearTimeout(to); resolve(msg); });
+          ws.send(JSON.stringify({ id: msgId, method, params }));
+        });
+      }
+      ws.on('message', (raw) => {
+        const msg = JSON.parse(raw);
+        if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
+      });
+      ws.on('open', async () => {
+        try {
+          const r = await call('Runtime.evaluate', {
+            expression: '(function() { const o = {}; o.access_token = localStorage.getItem(\\"access_token\\"); for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (/user-details|external/i.test(k)) o[k] = localStorage.getItem(k); } return JSON.stringify(o); })()',
+            returnByValue: true
+          });
+          console.log(r.result?.result?.value);
+        } catch (e) { console.error('ERR ' + e.message); }
+        process.exit(0);
+      });
+      ws.on('error', (e) => { console.error('WSERR ' + e.message); process.exit(1); });
+      setTimeout(() => process.exit(1), 15000);
+    `;
+    const tmpScript = path.join(__dirname, '.import_desktop.tmp.js');
+    fs.writeFileSync(tmpScript, script);
+    let out;
+    try {
+      // ws может лежать в node_modules прокси или глобально
+      try {
+        out = execFileSync('node', [tmpScript], { timeout: 20000, cwd: __dirname }).toString();
+      } catch (e1) {
+        // попробуем /tmp где уже установлен ws
+        const tmp2 = '/tmp/.import_desktop.tmp.js';
+        fs.copyFileSync(tmpScript, tmp2);
+        out = execFileSync('node', [tmp2], { timeout: 20000, cwd: '/tmp' }).toString();
+      }
+    } finally {
+      try { fs.unlinkSync(tmpScript); } catch (e) {}
+    }
+    
+    const data = JSON.parse(out.trim().split('\n').pop());
+    if (!data.access_token || data.access_token === 'null') {
+      return { error: 'No access_token in Postman localStorage. Sign in inside Postman desktop first.' };
+    }
+    
+    // вытаскиваем user_id из ключей вида user-details-<id>-externalId
+    let userId = null;
+    for (const k of Object.keys(data)) {
+      const m = k.match(/user-details-(\d+)/);
+      if (m) { userId = m[1]; break; }
+    }
+    
+    const account = upsertAccount({
+      access_token: data.access_token,
+      user_id: userId,
+      email: null,
+      source: 'desktop-import'
+    });
+    return { ok: true, account };
+  } catch (e) {
+    return { error: 'CDP import failed: ' + e.message };
+  }
+}
+
+function handleImportDesktop(req, res) {
+  const result = importFromDesktop();
+  if (result.error) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: result.error }));
+    console.error('[DESKTOP-IMPORT] failed:', result.error);
+    return;
+  }
+  console.log(`[DESKTOP-IMPORT] OK: user_id=${result.account.user_id}`);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    ok: true,
+    user_id: result.account.user_id,
+    message: 'Token imported from Postman desktop. See /accounts'
+  }));
+}
+
 function handleLogin(req, res) {
   const loginUrl = buildLoginUrl(req);
   console.log(`[OAUTH] Login start → ${loginUrl}`);
@@ -249,8 +352,10 @@ function handleAccounts(req, res) {
       </table>` : '<p>No accounts. Login with Postman:</p>'}
       ${envCount ? `<p>+ ${envCount} token(s) from POSTMAN_TOKEN env</p>` : ''}
       <a class="btn" href="/login">+ Add account via Postman login</a>
+      <a class="btn" style="background:#a6e3a1" href="/import-desktop">⬇ Import from Postman desktop</a>
     </div>
-    <div class="card"><p>Total tokens in pool: <b>${accounts.length + envCount}</b> (round-robin)</p></div>`));
+    <div class="card"><p>Total tokens in pool: <b>${accounts.length + envCount}</b> (round-robin)</p>
+    <p style="font-size:13px;opacity:.7">/import-desktop — берёт токен из запущенного Postman desktop (нужен включённый Postman с активным логином)</p></div>`));
 }
 
 function handleLogout(req, res, idx) {
@@ -731,6 +836,8 @@ const server = http.createServer((req, res) => {
     handleOAuthCallback(req, res);
   } else if (url.pathname === '/accounts') {
     handleAccounts(req, res);
+  } else if (url.pathname === '/import-desktop') {
+    handleImportDesktop(req, res);
   } else if (url.pathname.startsWith('/logout/')) {
     handleLogout(req, res, parseInt(url.pathname.split('/')[2], 10));
   } else if (url.pathname === '/' || url.pathname === '/health') {
