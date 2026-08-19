@@ -439,7 +439,7 @@ async function handleChatCompletions(req, res) {
   const token = getToken(req);
   if (!token) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: 'Missing API key. Pass Postman access_token as Bearer token.', type: 'authentication_error' } }));
+    res.end(JSON.stringify({ error: { message: 'No Postman token. Open http://localhost:' + PORT + '/login to sign in with Postman, or pass access_token as Bearer, or set POSTMAN_TOKEN env.', type: 'authentication_error' } }));
     return;
   }
   
