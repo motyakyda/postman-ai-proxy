@@ -5,12 +5,34 @@
 ## Как работает
 
 ```
-Клиент (curl/SDK/LiteLLM/...) → OpenAI format → [proxy :8790] → Postman format → gateway.postman.com/chat
+Клиент (curl/SDK/LiteLLM/...) → OpenAI format → [proxy :8787] → Postman format → gateway.postman.com/chat
 ```
 
+- `GET /login` — **вход через Postman OAuth** (браузер откроется, логинишься — токен подхватится автоматически)
+- `GET /accounts` — управление аккаунтами (пул, round-robin)
 - `POST /v1/chat/completions` — streaming и non-streaming
 - `GET /v1/models` — реальный список моделей из `GET gateway.postman.com/config`
 - `GET /health` — проверка живости
+
+## Быстрый старт
+
+```bash
+node server.js          # порт 8787
+# открыть http://localhost:8787/login → Sign in to Postman → готово
+```
+
+Токен сохраняется в `tokens.json`, прокси использует его автоматически. Несколько аккаунтов = несколько логинов (round-robin между ними).
+
+## OAuth: как это устроено
+
+Реверс-инжиниринг флоу Postman Desktop (Electron):
+
+1. Desktop-приложение открывает `identity.getpostman.com/client/login` с `app_id=erisedstraehruoytubecafruoytonwohsi` (строка — «erised»-зеркало из Гарри Поттера)
+2. После логина identity **сразу** редиректит на `redirect_uri` с токенами прямо в query:
+   `?access_token=...&user_id=...&team_id=...&email=...&multi_login_token=...`
+3. Никакого code exchange — прокси просто ловит redirect на `/oauth/callback` и сохраняет токен
+
+`workspaceId` в запросах к `gateway.postman.com/chat` **не валидируется** сервером — можно передать любой (проверено), поэтому OAuth-логина достаточно, ничего больше вытаскивать не нужно.
 
 ## Модели
 
@@ -33,43 +55,23 @@
 ## Запуск
 
 ```bash
-POSTMAN_TOKEN=<access_token> PORT=8790 node server.js
+# только OAuth-аккаунты (рекомендуется):
+PORT=8790 node server.js
+
+# или токены через env (round-robin через запятую):
+POSTMAN_TOKEN=<token1>,<token2> node server.js
 ```
-
-Несколько аккаунтов (round-robin):
-
-```bash
-POSTMAN_TOKEN=<token1>,<token2>,<token3> node server.js
-```
-
-## Как достать access_token
-
-1. Открой Postman Desktop, залогинься
-2. DevTools (Cmd+Shift+I или через `View → Toggle DevTools`) → Console:
-   ```js
-   copy(JSON.parse(localStorage.getItem('postmanDesktop').match(/"access_token":"([^"]+)"/)[1] ? RegExp.$1 : ''))
-   ```
-   Проще:
-   ```js
-   JSON.parse(localStorage.getItem('currentUser') || '{}')
-   ```
-   либо искать ключ `access_token` в localStorage.
-3. Либо через CDP-порт (файл `~/Library/Application Support/Postman/DevToolsActivePort`):
-   ```bash
-   PORT=$(head -1 ~/Library/Application\ Support/Postman/DevToolsActivePort)
-   # через /json/list найти page target и выполнить Runtime.evaluate на localStorage
-   ```
 
 ## Использование
 
 ```bash
-curl http://localhost:8790/v1/chat/completions \
+curl http://localhost:8787/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <postman_access_token>" \
+  -H "Authorization: Bearer anything" \
   -d '{"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-Если `Authorization` не передан (или передан `sk-...`), прокси использует токен из `POSTMAN_TOKEN`.
+`Authorization` опционален: если заголовок не передан (или передан `sk-...`), прокси берёт токен из пула (OAuth-аккаунты + `POSTMAN_TOKEN`).
 
 ### Особенности
 

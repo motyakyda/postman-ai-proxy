@@ -13,13 +13,20 @@
 
 const http = require('http');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 const { URL } = require('url');
 const crypto = require('crypto');
 
 // Конфигурация
 const PORT = process.env.PORT || 8787;
 const POSTMAN_GATEWAY = 'https://gateway.postman.com/chat';
-const DEFAULT_WORKSPACE_ID = process.env.POSTMAN_WORKSPACE_ID || 'your-workspace-id';
+const DEFAULT_WORKSPACE_ID = process.env.POSTMAN_WORKSPACE_ID || 'proxy-workspace';
+const TOKENS_FILE = path.join(__dirname, 'tokens.json');
+
+// OAuth (реверс Postman desktop: identity.getpostman.com/client/login, app_id из auth-бандла)
+const IDENTITY_LOGIN_URL = 'https://identity.getpostman.com/client/login';
+const POSTMAN_APP_ID = 'erisedstraehruoytubecafruoytonwohsi';
 // Реальные хэши инструментов/терминов, снятые с Postman 12.23.1 (darwin)
 const NATIVE_TOOLS_HASH = process.env.POSTMAN_TOOLS_HASH || 'clienttools-workspace_localmode_v12-desktop-darwin-12.23.1-ui-260811-0231-828d6b3ed37b';
 const NATIVE_TERMS_HASH = process.env.POSTMAN_TERMS_HASH || 'kbterms-workspace_localmode_v12-desktop-darwin-12.23.1-ui-260811-0231-dbc2c7575e92';
@@ -90,13 +97,172 @@ function getToken(req) {
     // sk-ключи не являются Postman-токенами — используем пул
     if (t && !t.startsWith('sk-')) return t;
   }
-  const pool = (process.env.POSTMAN_TOKEN || '').split(',').map(t => t.trim()).filter(Boolean);
+  const pool = getAllTokens();
   if (pool.length === 0) return '';
-  if (pool.length === 1) return pool[0];
+  if (pool.length === 1) return pool[0].access_token;
   const idx = tokenCursor++ % pool.length;
-  return pool[idx];
+  return pool[idx].access_token;
 }
 let tokenCursor = 0;
+
+// ===== Аккаунты (tokens.json) =====
+function loadAccounts() {
+  try {
+    const raw = fs.readFileSync(TOKENS_FILE, 'utf-8');
+    const data = JSON.parse(raw);
+    return Array.isArray(data) ? data : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveAccounts(accounts) {
+  fs.writeFileSync(TOKENS_FILE, JSON.stringify(accounts, null, 2));
+}
+
+function getAllTokens() {
+  const accounts = loadAccounts();
+  const envPool = (process.env.POSTMAN_TOKEN || '').split(',').map(t => t.trim()).filter(Boolean)
+    .map(t => ({ access_token: t, user_id: 'env', email: null, added_at: null }));
+  return [...accounts, ...envPool];
+}
+
+function upsertAccount(params) {
+  const accounts = loadAccounts();
+  const entry = {
+    user_id: params.user_id || null,
+    email: params.email || null,
+    username: params.username || null,
+    name: params.name || null,
+    team_id: params.team_id || null,
+    region: params.region || null,
+    multi_login_token: params.multi_login_token || null,
+    access_token: params.access_token,
+    added_at: new Date().toISOString()
+  };
+  const existing = accounts.findIndex(a => a.access_token === entry.access_token || (a.user_id && a.user_id === entry.user_id));
+  if (existing >= 0) {
+    accounts[existing] = { ...accounts[existing], ...entry };
+  } else {
+    accounts.push(entry);
+  }
+  saveAccounts(accounts);
+  return entry;
+}
+
+function buildLoginUrl(req) {
+  const host = req.headers.host || `localhost:${PORT}`;
+  const proto = req.headers['x-forwarded-proto'] || (host.startsWith('localhost') || host.startsWith('127.0.0.1') ? 'http' : 'https');
+  const redirectUri = `${proto}://${host}/oauth/callback`;
+  const qs = new URLSearchParams({
+    app_id: POSTMAN_APP_ID,
+    redirect_uri: redirectUri,
+    action_type: 'authorization_grant'
+  });
+  return `${IDENTITY_LOGIN_URL}?${qs.toString()}`;
+}
+
+function htmlPage(title, bodyHtml) {
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:640px;margin:60px auto;padding:0 20px;color:#e8e8e8;background:#1e1e2e}
+  a{color:#89b4fa} .card{background:#2a2a3c;border-radius:12px;padding:24px;margin:16px 0}
+  .ok{color:#a6e3a1} .tok{font-family:monospace;background:#181825;padding:8px 12px;border-radius:8px;word-break:break-all;font-size:13px}
+  table{width:100%;border-collapse:collapse;font-size:14px} td,th{padding:8px 12px;text-align:left;border-bottom:1px solid #3a3a4e}
+  .btn{display:inline-block;background:#89b4fa;color:#1e1e2e;text-decoration:none;font-weight:600;padding:10px 20px;border-radius:8px;margin-top:12px}
+</style></head><body>${bodyHtml}</body></html>`;
+}
+
+function handleLogin(req, res) {
+  const loginUrl = buildLoginUrl(req);
+  console.log(`[OAUTH] Login start → ${loginUrl}`);
+  res.writeHead(302, { Location: loginUrl });
+  res.end();
+}
+
+function handleOAuthCallback(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const p = url.searchParams;
+  
+  if (p.get('error')) {
+    res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(htmlPage('Login failed', `<div class="card"><h2>Login failed</h2>
+      <p><b>${p.get('error')}</b>: ${p.get('error_description') || ''}</p>
+      <a class="btn" href="/login">Try again</a></div>`));
+    return;
+  }
+  
+  const accessToken = p.get('access_token');
+  if (!accessToken) {
+    res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(htmlPage('No token', `<div class="card"><h2>No access_token in callback</h2>
+      <p>Query params received: ${[...p.keys()].join(', ') || 'none'}</p>
+      <a class="btn" href="/login">Try again</a></div>`));
+    return;
+  }
+  
+  const account = upsertAccount({
+    access_token: accessToken,
+    user_id: p.get('user_id'),
+    team_id: p.get('team_id'),
+    email: p.get('email'),
+    username: p.get('username'),
+    name: p.get('name'),
+    region: p.get('region'),
+    multi_login_token: p.get('multi_login_token')
+  });
+  
+  console.log(`[OAUTH] Login OK: user_id=${account.user_id} email=${account.email}`);
+  
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(htmlPage('Logged in', `<div class="card">
+    <h2 class="ok">✔ Logged in as ${account.email || account.name || account.user_id || 'user'}</h2>
+    <table>
+      <tr><th>user_id</th><td>${account.user_id || '—'}</td></tr>
+      <tr><th>team_id</th><td>${account.team_id || '—'}</td></tr>
+      <tr><th>region</th><td>${account.region || '—'}</td></tr>
+      <tr><th>access_token</th><td><span class="tok">${accessToken.slice(0, 12)}…${accessToken.slice(-8)}</span></td></tr>
+    </table>
+    <p>Token saved to <b>tokens.json</b>. The proxy now uses it automatically.</p>
+    <a class="btn" href="/accounts">Accounts</a>
+  </div>`));
+}
+
+function handleAccounts(req, res) {
+  const accounts = loadAccounts();
+  const envCount = (process.env.POSTMAN_TOKEN || '').split(',').filter(t => t.trim()).length;
+  const rows = accounts.map((a, i) => `<tr>
+    <td>${a.email || a.name || '—'}</td>
+    <td>${a.user_id || '—'}</td>
+    <td>${a.team_id || '—'}</td>
+    <td><span class="tok">${(a.access_token || '').slice(0, 10)}…</span></td>
+    <td>${a.added_at || '—'}</td>
+    <td><a href="/logout/${i}">remove</a></td>
+  </tr>`).join('');
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(htmlPage('Accounts', `
+    <h1>Postman AI Proxy — Accounts</h1>
+    <div class="card">
+      ${accounts.length || envCount ? `<table>
+        <tr><th>Email</th><th>User ID</th><th>Team</th><th>Token</th><th>Added</th><th></th></tr>
+        ${rows}
+      </table>` : '<p>No accounts. Login with Postman:</p>'}
+      ${envCount ? `<p>+ ${envCount} token(s) from POSTMAN_TOKEN env</p>` : ''}
+      <a class="btn" href="/login">+ Add account via Postman login</a>
+    </div>
+    <div class="card"><p>Total tokens in pool: <b>${accounts.length + envCount}</b> (round-robin)</p></div>`));
+}
+
+function handleLogout(req, res, idx) {
+  const accounts = loadAccounts();
+  if (idx >= 0 && idx < accounts.length) {
+    const removed = accounts.splice(idx, 1)[0];
+    saveAccounts(accounts);
+    console.log(`[OAUTH] Removed account: ${removed.email || removed.user_id}`);
+  }
+  res.writeHead(302, { Location: '/accounts' });
+  res.end();
+}
 
 function convertOpenAIToPostman(openaiBody, workspaceId) {
   const messages = openaiBody.messages || [];
@@ -480,11 +646,11 @@ function fetchModels() {
     if (modelsCache && Date.now() - modelsCacheTime < 10 * 60 * 1000) {
       return resolve(modelsCache);
     }
-    const token = process.env.POSTMAN_TOKEN || '';
+    const token = (getAllTokens()[0] || {}).access_token || '';
     const req = https.request('https://gateway.postman.com/config?platform=DESKTOP_MACOS', {
       method: 'GET',
       headers: {
-        'x-access-token': token.split(',')[0].trim(),
+        'x-access-token': token,
         'x-app-version': '12.23.1',
         'x-pstmn-req-service': 'agent-mode-service',
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Postman/12.23.1 Electron/37.10.3 Safari/537.36',
@@ -559,27 +725,40 @@ const server = http.createServer((req, res) => {
     handleChatCompletions(req, res);
   } else if (url.pathname === '/v1/models' && req.method === 'GET') {
     handleModels(req, res);
+  } else if (url.pathname === '/login') {
+    handleLogin(req, res);
+  } else if (url.pathname === '/oauth/callback') {
+    handleOAuthCallback(req, res);
+  } else if (url.pathname === '/accounts') {
+    handleAccounts(req, res);
+  } else if (url.pathname.startsWith('/logout/')) {
+    handleLogout(req, res, parseInt(url.pathname.split('/')[2], 10));
   } else if (url.pathname === '/' || url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'postman-ai-proxy', port: PORT }));
+    res.end(JSON.stringify({
+      status: 'ok', service: 'postman-ai-proxy', port: PORT,
+      accounts: loadAccounts().length,
+      login_url: '/login'
+    }));
   } else {
     res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found. Use /v1/chat/completions or /v1/models' }));
+    res.end(JSON.stringify({ error: 'Not found. Use /v1/chat/completions, /v1/models, /login, /accounts' }));
   }
 });
 
 server.listen(PORT, () => {
   console.log(`\n🚀 Postman AI Proxy running on http://localhost:${PORT}`);
-  console.log(`   OpenAI-compatible endpoint: http://localhost:${PORT}/v1/chat/completions`);
-  console.log(`   Models endpoint: http://localhost:${PORT}/v1/models`);
-  console.log(`\n   Supported models:`);
-  Object.entries(MODEL_MAP).filter(([k]) => k !== 'default').forEach(([openai, postman]) => {
-    console.log(`     ${openai} → ${postman}`);
-  });
-  console.log(`\n   Usage:`);
-  console.log(`     curl http://localhost:${PORT}/v1/chat/completions \\`);
-  console.log(`       -H "Authorization: Bearer YOUR_POSTMAN_ACCESS_TOKEN" \\`);
-  console.log(`       -H "Content-Type: application/json" \\`);
-  console.log(`       -d '{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"Hello"}],"stream":true}'`);
+  console.log(`\n   ┌──────────────────────────────────────────────────┐`);
+  console.log(`   │  Login:   http://localhost:${PORT}/login`.padEnd(53) + `│`);
+  console.log(`   │  Accounts: http://localhost:${PORT}/accounts`.padEnd(53) + `│`);
+  console.log(`   │  API:     http://localhost:${PORT}/v1/chat/completions`.padEnd(53) + `│`);
+  console.log(`   │  Models:  http://localhost:${PORT}/v1/models`.padEnd(53) + `│`);
+  console.log(`   └──────────────────────────────────────────────────┘`);
+  const accounts = loadAccounts();
+  const envTokens = (process.env.POSTMAN_TOKEN || '').split(',').filter(t => t.trim()).length;
+  console.log(`\n   Token pool: ${accounts.length} OAuth account(s) + ${envTokens} env token(s)`);
+  if (accounts.length === 0 && envTokens === 0) {
+    console.log(`   ⚠ No tokens. Open http://localhost:${PORT}/login to sign in with Postman`);
+  }
   console.log();
 });
